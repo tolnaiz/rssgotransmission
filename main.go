@@ -32,6 +32,7 @@ type Config struct {
 	Username        string
 	Password        string
 	DownloadDir     string // optional, empty => Transmission default
+	Debug           bool
 }
 
 // State keeps a set of seen item IDs so we don't re-add them.
@@ -68,7 +69,6 @@ func (s *State) save(path string) error {
 	if err != nil {
 		return err
 	}
-	// atomic-ish write
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
@@ -97,6 +97,7 @@ type Transmission struct {
 	Client   *http.Client
 	sessID   string
 	sessLock sync.Mutex
+	Debug    bool
 }
 
 type rpcReq struct {
@@ -109,28 +110,34 @@ type rpcResp struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-func NewTransmission(u, user, pass string) *Transmission {
+func NewTransmission(u, user, pass string, debug bool) *Transmission {
 	return &Transmission{
 		URL:    u,
 		User:   user,
 		Pass:   pass,
 		Client: &http.Client{Timeout: 30 * time.Second},
+		Debug:  debug,
 	}
 }
 
 func (t *Transmission) do(ctx context.Context, payload any) (*rpcResp, error) {
 	b, _ := json.Marshal(payload)
+	if t.Debug {
+		log.Printf("DEBUG: sending RPC request to %s: %s", t.URL, string(b))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.URL, strings.NewReader(string(b)))
 	if err != nil { return nil, err }
 	req.Header.Set("Content-Type", "application/json")
 	if t.User != "" {
 		req.SetBasicAuth(t.User, t.Pass)
 	}
-	// ensure session id
 	resp, err := t.doWithSession(req)
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if t.Debug {
+		log.Printf("DEBUG: RPC response status=%d body=%s", resp.StatusCode, string(body))
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("transmission bad status: %s: %s", resp.Status, string(body))
 	}
@@ -150,9 +157,17 @@ func (t *Transmission) doWithSession(req *http.Request) (*http.Response, error) 
 		req.Header.Set("X-Transmission-Session-Id", sess)
 	}
 	resp, err := t.Client.Do(req)
-	if err != nil { return nil, err }
-	if resp.StatusCode == 409 { // need/refresh session id
+	if err != nil {
+		if t.Debug {
+			log.Printf("DEBUG: request error: %v", err)
+		}
+		return nil, err
+	}
+	if resp.StatusCode == 409 {
 		newSess := resp.Header.Get("X-Transmission-Session-Id")
+		if t.Debug {
+			log.Printf("DEBUG: got 409, new session id=%s", newSess)
+		}
 		_ = resp.Body.Close()
 		if newSess == "" {
 			return nil, fmt.Errorf("missing session id after 409")
@@ -160,7 +175,6 @@ func (t *Transmission) doWithSession(req *http.Request) (*http.Response, error) 
 		t.sessLock.Lock()
 		t.sessID = newSess
 		t.sessLock.Unlock()
-		// retry
 		req2 := req.Clone(req.Context())
 		req2.Header.Set("X-Transmission-Session-Id", newSess)
 		return t.Client.Do(req2)
@@ -168,8 +182,10 @@ func (t *Transmission) doWithSession(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// Add magnet or torrent URL to Transmission
 func (t *Transmission) Add(ctx context.Context, uri string, downloadDir string) error {
+	if t.Debug {
+		log.Printf("DEBUG: adding URI to Transmission: %s", uri)
+	}
 	args := map[string]any{
 		"filename": uri,
 	}
@@ -180,9 +196,7 @@ func (t *Transmission) Add(ctx context.Context, uri string, downloadDir string) 
 	return err
 }
 
-// Utility to create a stable ID from feed item
 func itemID(it *gofeed.Item) string {
-	// Prefer GUID, then link, then title+date hash
 	if it.GUID != "" { return it.GUID }
 	if it.Link != "" { return it.Link }
 	h := sha1.Sum([]byte(it.Title + it.Published + it.Updated))
@@ -190,7 +204,6 @@ func itemID(it *gofeed.Item) string {
 }
 
 func pickTorrentURI(it *gofeed.Item) string {
-	// Try enclosure URL first
 	if it.Enclosures != nil {
 		for _, e := range it.Enclosures {
 			ct := strings.ToLower(e.Type)
@@ -199,11 +212,9 @@ func pickTorrentURI(it *gofeed.Item) string {
 			}
 		}
 	}
-	// Fallback: link could be a magnet
-	if strings.HasPrefix(it.Link, "magnet:") {
+	if strings.HasSuffix(strings.ToLower(it.Link), ".torrent") || strings.HasPrefix(it.Link, "magnet:") {
 		return it.Link
 	}
-	// Some feeds place magnet in item content
 	if it.Content != "" && strings.Contains(it.Content, "magnet:") {
 		idx := strings.Index(it.Content, "magnet:")
 		end := strings.IndexAny(it.Content[idx:], " \"'\n\t<")
@@ -248,8 +259,8 @@ func loadConfig() Config {
 	user := os.Getenv("TRANSMISSION_USER")
 	pass := os.Getenv("TRANSMISSION_PASS")
 	dldir := os.Getenv("DOWNLOAD_DIR")
+	debug := strings.ToLower(os.Getenv("DEBUG")) == "true"
 
-	// Flags override env if provided
 	flagFeeds := flag.String("feeds", strings.Join(feeds, ","), "Comma-separated feed URLs")
 	flagInterval := flag.Duration("interval", interval, "Poll interval (e.g. 10m, 1h)")
 	flagState := flag.String("state", statePath, "Path to state file")
@@ -257,6 +268,7 @@ func loadConfig() Config {
 	flagUser := flag.String("user", user, "Transmission username")
 	flagPass := flag.String("pass", pass, "Transmission password")
 	flagDL := flag.String("download-dir", dldir, "Optional Transmission download directory")
+	flagDebug := flag.Bool("debug", debug, "Enable debug logging")
 	flag.Parse()
 
 	f := []string{}
@@ -275,6 +287,7 @@ func loadConfig() Config {
 		Username:        *flagUser,
 		Password:        *flagPass,
 		DownloadDir:     *flagDL,
+		Debug:           *flagDebug,
 	}
 }
 
@@ -288,7 +301,7 @@ func run(ctx context.Context, cfg Config) error {
 
 	state, err := loadState(cfg.StatePath)
 	if err != nil { return err }
-	client := NewTransmission(cfg.TransmissionURL, cfg.Username, cfg.Password)
+	client := NewTransmission(cfg.TransmissionURL, cfg.Username, cfg.Password, cfg.Debug)
 	parser := gofeed.NewParser()
 
 	poll := func() {
@@ -306,7 +319,9 @@ func run(ctx context.Context, cfg Config) error {
 				if state.isSeen(id) { continue }
 				uri := pickTorrentURI(it)
 				if uri == "" {
-					// Not directly a torrent/magnet; skip and mark seen to avoid repeated scans
+					if cfg.Debug {
+						log.Printf("DEBUG: skipped %q (no torrent/magnet found)", it.Title)
+					}
 					state.markSeen(id)
 					continue
 				}
@@ -325,7 +340,6 @@ func run(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// initial run
 	poll()
 	if cfg.PollInterval <= 0 { return nil }
 	t := time.NewTicker(cfg.PollInterval)
@@ -342,7 +356,7 @@ func run(ctx context.Context, cfg Config) error {
 
 func main() {
 	cfg := loadConfig()
-	log.Printf("Starting rssgotransmission; feeds=%d, interval=%s, state=%s, trans=%s", len(cfg.Feeds), cfg.PollInterval, cfg.StatePath, cfg.TransmissionURL)
+	log.Printf("Starting rss2transmission; feeds=%d, interval=%s, state=%s, trans=%s, debug=%v", len(cfg.Feeds), cfg.PollInterval, cfg.StatePath, cfg.TransmissionURL, cfg.Debug)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, cfg); err != nil {
