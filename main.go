@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -131,7 +132,7 @@ func (t *Transmission) do(ctx context.Context, payload any) (*rpcResp, error) {
 	if t.User != "" {
 		req.SetBasicAuth(t.User, t.Pass)
 	}
-	resp, err := t.doWithSession(req)
+	resp, err := t.doWithSession(req, b)
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -149,7 +150,7 @@ func (t *Transmission) do(ctx context.Context, payload any) (*rpcResp, error) {
 	return &r, nil
 }
 
-func (t *Transmission) doWithSession(req *http.Request) (*http.Response, error) {
+func (t *Transmission) doWithSession(req *http.Request, body []byte) (*http.Response, error) {
 	t.sessLock.Lock()
 	sess := t.sessID
 	t.sessLock.Unlock()
@@ -177,6 +178,8 @@ func (t *Transmission) doWithSession(req *http.Request) (*http.Response, error) 
 		t.sessLock.Unlock()
 		req2 := req.Clone(req.Context())
 		req2.Header.Set("X-Transmission-Session-Id", newSess)
+		req2.Body = io.NopCloser(bytes.NewReader(body))
+		req2.ContentLength = int64(len(body))
 		return t.Client.Do(req2)
 	}
 	return resp, nil
